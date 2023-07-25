@@ -5,8 +5,10 @@
 #include<d3d12.h>
 #include<dxgi1_6.h>
 #include<cassert>
+#include<dxcapi.h>
 #pragma comment(lib,"d3d12.lib")
 #pragma comment(lib,"dxgi.lib")
+#pragma comment(lib,"dxcompiler.lib")
 
 
 //ウィンドウプロシージャ
@@ -57,7 +59,94 @@ void Log(const std::string& message) {
 }
 
 
+//////CompileShader関数
+IDxcBlob* CompilerShader(
+	//compilerするshaderファイルへのパス
+	const std::wstring& filePath,
+	//compilerに使用するProfile
+	const wchar_t* profile,
+	//初期化で生成したものを3つ
+	IDxcUtils* dxcUtils,
+	IDxcCompiler3* dxcCompiler,
+	IDxcIncludeHandler* includeHandler) {
 
+	//1.hlslファイルを読む
+
+	//これからシェーダーをコンパイルする旨をログに出す
+	Log(ConvertString(std::format(L"Begin CompileShader, path:{}, profile:{}\n", filePath, profile)));
+
+
+	//1.hlslファイルを読む
+	IDxcBlobEncoding* shaderSource = nullptr;
+	HRESULT hr = dxcUtils->LoadFile(filePath.c_str(), nullptr, &shaderSource);
+
+	//読めなかったら止める
+	assert(SUCCEEDED(hr));
+
+	//読み込んだファイルの内容の設定する
+	DxcBuffer shaderSourceBuffer;
+	shaderSourceBuffer.Ptr = shaderSource->GetBufferPointer();
+	shaderSourceBuffer.Size = shaderSource->GetBufferSize();
+	shaderSourceBuffer.Encoding = DXC_CP_UTF8; //UTF8の文字コードであることを通知
+
+
+	//2.Compileする
+	LPCWSTR arguments[] =
+	{
+		filePath.c_str(), //コンパイル対象のhlslファイル名
+		L"-E",L"main", //エントリーポイントの指定。基本敵にmain以外にはしない
+		L"-T",profile, //ShaderProfileの設定
+		L"-Zi",L"-Qembed_debug", //デバッグ用の情報を埋め込む
+		L"-Od", //最適化を外しておく
+		L"-Zpr",//メモリレイアウトは行優先
+	};
+
+	//実際にShaderをコンパイルする
+	IDxcResult* shaderResult = nullptr;
+	hr = dxcCompiler->Compile(
+		&shaderSourceBuffer, //読み込んだファイル
+		arguments, //コンパイルオプション
+		_countof(arguments), //コンパイルオプションの数
+		includeHandler, //includeが含まれた諸々
+		IID_PPV_ARGS(&shaderResult) //コンパイル結果
+	);
+
+	//コンパイルエラーではなくdxcが起動できないなど致命的な状況
+	assert(SUCCEEDED(hr));
+
+
+
+	//3.警告エラーがでていないか確認する
+
+	//警告、エラーが出てたらログに出して止める
+	IDxcBlobUtf8* shaderError = nullptr;
+	shaderResult->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&shaderError), nullptr);//
+
+	if (shaderError != nullptr && shaderError->GetStringLength() != 0)
+	{
+		Log(shaderError->GetStringPointer());
+
+		//警告・エラーダメゼッタイ
+		assert(false);
+	}
+
+	//4.Compile結果を受け取って返す
+
+	//コンパイル結果から実行用のバイナリ部分を取得
+	IDxcBlob* shaderBlob = nullptr;
+	hr = shaderResult->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&shaderBlob), nullptr);
+	assert(SUCCEEDED(hr));
+
+	//成功したログを出す
+	Log(ConvertString(std::format(L"Compile Succeeded, path:{},profile:{}", filePath, profile)));
+
+	//もう使わないリソースを解放
+	shaderSource->Release();
+	shaderResult->Release();
+
+	//実行用のバイナリを返却
+	return shaderBlob;
+}
 
 
 
@@ -356,7 +445,21 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 	assert(fenceEvent != nullptr);
 
 
+	/////DXCの初期化
+	IDxcUtils* dxcUtils = nullptr;
+	IDxcCompiler3* dxcCompiler = nullptr;
 
+	hr = DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&dxcUtils));
+	assert(SUCCEEDED(hr));
+
+	hr = DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&dxcCompiler));
+	assert(SUCCEEDED(hr));
+
+
+	//現時点でincludeはしないが、includeに対応するための設定を行っておく
+	IDxcIncludeHandler* includeHandler = nullptr;
+	hr = dxcUtils->CreateDefaultIncludeHandler(&includeHandler);
+	assert(SUCCEEDED(hr));
 
 
 	MSG msg{};
@@ -401,6 +504,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 			//指定した色で画面全体クリアする
 			float clearColor[] = { 0.1f,0.25f,0.5f,1.0f }; //青っぽい。RGBAの順
 			commandList->ClearRenderTargetView(rtvHandles[backBufferIndex], clearColor, 0, nullptr);
+
+			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			//遷移後のResourceState
+			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+			//TransitionBarrierを張る
+			commandList->ResourceBarrier(1, &barrier);
+
+
+
 
 			//コマンドリストの内容を確定させる。全てのコマンドを積んでからCloseすること
 			hr = commandList->Close();
@@ -450,8 +562,38 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
 
 
+	CloseHandle(fenceEvent);
+	fence->Release();
+	rtvDescriptorHeap->Release();
+	swapChainResource[0]->Release();
+	swapChainResource[1]->Release();
+	swapChain->Release();
+	commandList->Release();
+	commandAllocator->Release();
+	commandQueue->Release();
+	device->Release();
+	useAdapter->Release();
+	dxgiFactory->Release();
+#ifdef _DEBUG
 	
+	debugController->Release();
 
+
+
+#endif 
+	CloseWindow(hwnd);
+
+
+	
+	//リソースリークチェック
+	IDXGIDebug1* debug;
+	if (SUCCEEDED(DXGIGetDebugInterface1(0, IID_PPV_ARGS(&debug))))
+	{
+		debug->ReportLiveObjects(DXGI_DEBUG_ALL, DXGI_DEBUG_RLO_ALL);
+		debug->ReportLiveObjects(DXGI_DEBUG_APP, DXGI_DEBUG_RLO_ALL);
+		debug->ReportLiveObjects(DXGI_DEBUG_D3D12, DXGI_DEBUG_RLO_ALL);
+		debug->Release();
+	}
 
 
 
